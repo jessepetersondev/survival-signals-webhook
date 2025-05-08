@@ -1,0 +1,42 @@
+# Python bytecode
+*.py[cod]
+__pycache__/
+
+# Environments
+.env
+*.env
+venv/
+env/
+.venv/
+
+# Logs and databases
+*.log
+logs/
+user_data/logs/
+
+# Freqtrade data/backtest outputs
+user_data/backtest_results/
+user_data/data/
+user_data/trade_history.json
+
+# Webhook service
+webhook-service/*.pyc
+webhook-service/__pycache__/
+
+# Static site build files
+env.js
+
+# Node modules (if any)
+node_modules/
+
+# IDE and editor folders
+.vscode/
+.idea/
+
+# Build directories
+dist/
+build/
+
+# System files
+.DS_Store
+Thumbs.db
