@@ -4,11 +4,13 @@ import requests
 from flask import Flask, jsonify, request, abort
 from dotenv import load_dotenv
 from notify_signals import send_signal
+from flask_cors import CORS
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app, origins=["https://survivalsignals.trade"])
 
 # Stripe and Telegram configuration
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
