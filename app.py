@@ -15,24 +15,49 @@ CORS(app, origins=["https://survivalsignals.trade"])
 # Stripe and Telegram configuration
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
-TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN')
-TG_CHAT_ID  = os.getenv('TG_CHAT_ID')
+TG_BOT_TOKEN    = os.getenv('TG_BOT_TOKEN')
+TG_CHAT_ID      = os.getenv('TG_CHAT_ID')
+PRICE_ID        = os.getenv('STRIPE_PRICE_ID', 'price_1RMYrR2X75x3JSfv5Ad0YdRk')
+
+# Utility: Create a single-use Telegram invite link
+def create_one_time_invite():
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/createChatInviteLink"
+    payload = {
+        'chat_id': TG_CHAT_ID,
+        'member_limit': 1
+    }
+    resp = requests.post(url, json=payload)
+    resp.raise_for_status()
+    return resp.json().get('result', {}).get('invite_link')
+
+# Utility: Send a direct message to a user
+def send_dm(telegram_id, text):
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': telegram_id,
+        'text': text
+    }
+    resp = requests.post(url, json=payload)
+    resp.raise_for_status()
 
 # Endpoint: Create Checkout Session
 @app.route('/create-checkout-session', methods=['POST'])
 def create_checkout_session():
     data = request.json or {}
     telegram_id = data.get('telegram_user_id')
+    if not telegram_id:
+        return jsonify({'error': 'Missing telegram_user_id'}), 400
+
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
         line_items=[{
-            'price': 'price_1RMYrR2X75x3JSfv5Ad0YdRk',
+            'price': PRICE_ID,
             'quantity': 1
         }],
         mode='subscription',
         success_url='https://survivalsignals.trade/success',
         cancel_url='https://survivalsignals.trade/cancel',
-        metadata={'telegram_user_id': telegram_id}
+        metadata={'telegram_user_id': str(telegram_id)}
     )
     return jsonify({'sessionId': session.id})
 
@@ -42,28 +67,30 @@ def stripe_webhook():
     payload = request.get_data(as_text=True)
     sig_header = request.headers.get('Stripe-Signature')
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, WEBHOOK_SECRET
-        )
+        event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
     except (ValueError, stripe.error.SignatureVerificationError):
         abort(400)
 
     # Handle successful invoice payment
     if event['type'] == 'invoice.paid':
         invoice = event['data']['object']
-        customer = invoice['customer']
         telegram_id = invoice['metadata'].get('telegram_user_id')
         if telegram_id:
-            # Notify admin channel
-            message = f"✅ New subscription: customer {customer} granted access."
-            send_signal(message)
-            # Invite subscriber to Telegram group
-            invite_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/inviteChatMember"
-            requests.post(invite_url, json={
-                'chat_id': TG_CHAT_ID,
-                'user_id': telegram_id
-            })
-    return '', 200
+            # Send admin notification
+            customer = invoice.get('customer')
+            send_signal(f"✅ New subscription: customer {customer} (TG: {telegram_id})")
+
+            # Generate a one-time invite link
+            try:
+                invite_link = create_one_time_invite()
+                # DM the invite link to the user
+                text = f"🎉 Welcome! Use this one-time link to join Survival Signals Bot group: {invite_link}"
+                send_dm(telegram_id, text)
+            except Exception as e:
+                # Log failure but continue
+                send_signal(f"❌ Failed to create invite for {telegram_id}: {e}")
+
+    return ('', 200)
 
 if __name__ == '__main__':
-    app.run(port=5000)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
