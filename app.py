@@ -61,12 +61,16 @@ def create_checkout_session():
     )
     return jsonify({'sessionId': session.id})
 
-# Endpoint: Stripe Webhook Receiver with detailed logging
-@app.route('/webhook/stripe', methods=['POST'])
+# Endpoint: Stripe Webhook Receiver (supports GET for health-check and POST for events)
+@app.route('/webhook/stripe', methods=['GET', 'POST'])
 def stripe_webhook():
+    if request.method == 'GET':
+        # Respond to health checks or method verification
+        return jsonify({'status': 'ok'}), 200
+
+    # POST: Handle Stripe events
     payload = request.get_data(as_text=True)
     sig_header = request.headers.get('Stripe-Signature')
-    # Log receipt of webhook
     send_signal(f"🔔 Webhook received: {payload[:200]}...")
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
@@ -90,6 +94,7 @@ def stripe_webhook():
                 send_signal(f"✉️ DM sent to {telegram_id}")
             except Exception as e:
                 send_signal(f"❌ Failed to create/send invite for {telegram_id}: {e}")
+
     return ('', 200)
 
 if __name__ == '__main__':
