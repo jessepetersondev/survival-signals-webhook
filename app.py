@@ -10,15 +10,15 @@ from flask_cors import CORS
 load_dotenv()
 
 app = Flask(__name__)
-# Enable CORS for health-checks and webhooks
+# Enable CORS for front-end and webhooks
 CORS(app, origins=["https://survivalsignals.trade"], supports_credentials=True)
 
-# Stripe and Telegram configuration
+# Configuration
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET') or os.getenv('STRIPE_WEBHOOK_SECRET')
-TG_BOT_TOKEN    = os.getenv('TG_BOT_TOKEN')
-TG_CHAT_ID      = os.getenv('TG_CHAT_ID')
-PRICE_ID        = os.getenv('STRIPE_PRICE_ID', 'price_1RMYrR2X75x3JSfv5Ad0YdRk')
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN')
+TG_CHAT_ID = os.getenv('TG_CHAT_ID')
+PRICE_ID = os.getenv('STRIPE_PRICE_ID', 'price_1RMYrR2X75x3JSfv5Ad0YdRk')
 
 # Utility: Create a single-use Telegram invite link
 def create_one_time_invite():
@@ -35,12 +35,14 @@ def send_dm(telegram_id, text):
     resp = requests.post(url, json=payload)
     resp.raise_for_status()
 
-# Endpoint: Create Checkout Session\ n@app.route('/create-checkout-session', methods=['POST'])
+# Endpoint: Create Checkout Session
+@app.route('/create-checkout-session', methods=['POST'])
 def create_checkout_session():
     data = request.json or {}
     telegram_id = data.get('telegram_user_id')
     if not telegram_id:
         return jsonify({'error': 'Missing telegram_user_id'}), 400
+    # Create Stripe Checkout session
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
         line_items=[{'price': PRICE_ID, 'quantity': 1}],
@@ -51,19 +53,19 @@ def create_checkout_session():
     )
     return jsonify({'sessionId': session.id})
 
-# Endpoint: Stripe Webhook Receiver (support GET, POST, OPTIONS)
+# Endpoint: Stripe Webhook Receiver (supports preflight)
 @app.route('/webhook/stripe', methods=['OPTIONS', 'GET', 'POST'])
 def stripe_webhook():
-    # Handle CORS preflight
+    # CORS preflight
     if request.method == 'OPTIONS':
         return '', 200
-    # GET for healthcheck
+    # Health check
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
-    # POST: process Stripe event
+    # Process POST event
     payload = request.get_data(as_text=True)
     sig_header = request.headers.get('Stripe-Signature')
-    send_signal(f"🔔 Webhook received: {payload[:200]}...")
+    send_signal(f"🔔 Webhook received: {payload[:200]}..." )
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
     except Exception as e:
@@ -75,15 +77,14 @@ def stripe_webhook():
         telegram_id = invoice.get('metadata', {}).get('telegram_user_id')
         send_signal(f"🔍 Metadata TG ID: {telegram_id}")
         if telegram_id:
-            customer = invoice.get('customer')
-            send_signal(f"✅ Subscription for cus {customer} (TG {telegram_id})")
+            send_signal(f"✅ New subscription event for TG ID: {telegram_id}")
             try:
                 invite_link = create_one_time_invite()
-                send_signal(f"🔗 Link: {invite_link}")
-                send_dm(telegram_id, f"🎉 Use this one-time link to join: {invite_link}")
+                send_signal(f"🔗 Invite link generated: {invite_link}")
+                send_dm(telegram_id, f"🎉 Welcome! Use this one-time link to join: {invite_link}")
                 send_signal(f"✉️ DM sent to {telegram_id}")
             except Exception as e:
-                send_signal(f"❌ Invite error for {telegram_id}: {e}")
+                send_signal(f"❌ Failed to send invite: {e}")
     return '', 200
 
 if __name__ == '__main__':
