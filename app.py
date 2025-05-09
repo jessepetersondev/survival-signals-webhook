@@ -61,35 +61,35 @@ def create_checkout_session():
     )
     return jsonify({'sessionId': session.id})
 
-# Endpoint: Stripe Webhook Receiver
+# Endpoint: Stripe Webhook Receiver with detailed logging
 @app.route('/webhook/stripe', methods=['POST'])
 def stripe_webhook():
     payload = request.get_data(as_text=True)
     sig_header = request.headers.get('Stripe-Signature')
+    # Log receipt of webhook
+    send_signal(f"🔔 Webhook received: {payload[:200]}...")
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
-    except (ValueError, stripe.error.SignatureVerificationError):
+    except Exception as e:
+        send_signal(f"❌ Webhook signature verification failed: {e}")
         abort(400)
 
-    # Handle successful invoice payment
+    send_signal(f"✅ Webhook event type: {event['type']}")
     if event['type'] == 'invoice.paid':
         invoice = event['data']['object']
-        telegram_id = invoice['metadata'].get('telegram_user_id')
+        telegram_id = invoice.get('metadata', {}).get('telegram_user_id')
+        send_signal(f"🔍 invoice.paid metadata telegram_user_id: {telegram_id}")
         if telegram_id:
-            # Send admin notification
             customer = invoice.get('customer')
             send_signal(f"✅ New subscription: customer {customer} (TG: {telegram_id})")
-
-            # Generate a one-time invite link
             try:
                 invite_link = create_one_time_invite()
-                # DM the invite link to the user
-                text = f"🎉 Welcome! Use this one-time link to join Survival Signals Bot group: {invite_link}"
+                send_signal(f"🔗 Invite link generated: {invite_link}")
+                text = f"🎉 Welcome! Use this one-time link to join: {invite_link}"
                 send_dm(telegram_id, text)
+                send_signal(f"✉️ DM sent to {telegram_id}")
             except Exception as e:
-                # Log failure but continue
-                send_signal(f"❌ Failed to create invite for {telegram_id}: {e}")
-
+                send_signal(f"❌ Failed to create/send invite for {telegram_id}: {e}")
     return ('', 200)
 
 if __name__ == '__main__':
