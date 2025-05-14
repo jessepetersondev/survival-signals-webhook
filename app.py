@@ -7,9 +7,9 @@ from dotenv import load_dotenv
 from notify_signals import send_signal
 from flask_cors import CORS
 
-# Configure detailed logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
-logger = logging.getLogger('app')
+# Initialize logging to stdout for Railway
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -18,177 +18,146 @@ CORS(app, origins=["https://survivalsignals.trade"], supports_credentials=True)
 
 # Configuration
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
-WEBHOOK_SECRET   = os.getenv('STRIPE_WEBHOOK_SECRET')
-TG_BOT_TOKEN     = os.getenv('TG_BOT_TOKEN')
-TG_CHAT_ID       = os.getenv('TG_CHAT_ID')
-PRICE_ID         = os.getenv('STRIPE_PRICE_ID', 'price_1RMYrR2X75x3JSfv5Ad0YdRk')
+WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
+TG_BOT_TOKEN   = os.getenv('TG_BOT_TOKEN')
+TG_CHAT_ID     = os.getenv('TG_CHAT_ID')
+PRICE_ID       = os.getenv('STRIPE_PRICE_ID', 'price_1RMYrR2X75x3JSfv5Ad0YdRk')
 
-logger.debug(f"Config loaded: TG_CHAT_ID={TG_CHAT_ID}, PRICE_ID={PRICE_ID}")
-
-# Idempotency store
+# In-memory idempotency store (persist in DB for production)
 processed_events = set()
 def already_processed(event_id):
-    logger.debug(f"Checking idempotency for event {event_id}")
     if event_id in processed_events:
-        logger.info(f"Skipping duplicate event {event_id}")
         return True
     processed_events.add(event_id)
-    logger.debug(f"Marked event {event_id} as processed")
     return False
 
-# Extract raw bot token
+# Helper: Extract raw bot token from env
 def get_bot_token():
     token = TG_BOT_TOKEN or ''
-    logger.debug(f"Raw TG_BOT_TOKEN: {token}")
     if token.startswith('http'):
         try:
             from urllib.parse import urlparse
             path = urlparse(token).path
             if path.lower().startswith('/bot'):
                 token = path[4:]
-                logger.debug(f"Extracted token from URL: {token}")
-        except Exception as e:
-            logger.error(f"Error parsing bot token URL: {e}")
+        except Exception:
+            pass
     if token.lower().startswith('bot'):
         token = token[3:]
-        logger.debug(f"Stripped 'bot' prefix, token now: {token}")
     return token
 
-# Create a one-time invite link
+# Create a single-use Telegram invite link
 def create_one_time_invite():
-    logger.debug("Entering create_one_time_invite")
     token = get_bot_token()
     url = f"https://api.telegram.org/bot{token}/createChatInviteLink"
     payload = {'chat_id': TG_CHAT_ID, 'member_limit': 1}
-    logger.debug(f"Calling Telegram API: POST {url} payload={payload}")
+    logger.info(f"[create_one_time_invite] URL: {url}, Payload: {payload}")
     resp = requests.post(url, json=payload)
-    logger.debug(f"Telegram response: HTTP {resp.status_code} {resp.text}")
+    logger.info(f"[create_one_time_invite] HTTP {resp.status_code}: {resp.text}")
     if resp.status_code != 200:
-        logger.error(f"Invite HTTP error {resp.status_code}: {resp.text}")
+        logger.error(f"Invite link HTTP error {resp.status_code}: {resp.text}")
         resp.raise_for_status()
     data = resp.json()
     if not data.get('ok'):
-        logger.error(f"Telegram API createChatInviteLink error: {data}")
-        raise Exception(data.get('description'))
+        logger.error(f"Telegram API error: {data}")
+        raise Exception(f"Telegram API error: {data.get('description')}")
     link = data['result']['invite_link']
-    logger.info(f"Generated invite link: {link}")
+    logger.info(f"[create_one_time_invite] Success, link: {link}")
     return link
 
-# Send a direct message via Telegram
+# Send a direct message to a Telegram user
 def send_dm(telegram_id, text):
-    logger.debug(f"Entering send_dm for TG {telegram_id}")
     token = get_bot_token()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {'chat_id': telegram_id, 'text': text}
-    logger.debug(f"Calling Telegram API: POST {url} payload={payload}")
+    logger.info(f"[send_dm] URL: {url}, Payload: {payload}")
     resp = requests.post(url, json=payload)
-    logger.debug(f"Telegram sendMessage response: HTTP {resp.status_code} {resp.text}")
+    logger.info(f"[send_dm] HTTP {resp.status_code}: {resp.text}")
     if resp.status_code != 200:
-        logger.error(f"DM HTTP error {resp.status_code}: {resp.text}")
+        logger.error(f"send_dm HTTP error {resp.status_code}: {resp.text}")
         resp.raise_for_status()
     data = resp.json()
     if not data.get('ok'):
-        logger.error(f"Telegram API sendMessage error: {data}")
-        raise Exception(data.get('description'))
-    logger.info(f"DM successfully sent to {telegram_id}")
+        logger.error(f"Telegram API error on send_dm: {data}")
+        raise Exception(f"Telegram API error: {data.get('description')}")
+    logger.info(f"[send_dm] Message successfully sent to {telegram_id}")
 
-# Create Stripe Checkout Session
+# Endpoint: Create a Stripe Checkout Session
 @app.route('/create-checkout-session', methods=['POST'])
 def create_checkout_session():
-    logger.debug("create_checkout_session invoked")
     data = request.json or {}
-    tg_id = data.get('telegram_user_id')
-    logger.info(f"Telegram ID!!!!!!!!! {tg_id}")
-    logger.debug(f"Payload data: {data}")
-    if not tg_id:
+    telegram_id = data.get('telegram_user_id')
+    if not telegram_id:
         logger.warning("Missing telegram_user_id in request")
         return jsonify({'error': 'Missing telegram_user_id'}), 400
+
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
         line_items=[{'price': PRICE_ID, 'quantity': 1}],
         mode='subscription',
         success_url='https://survivalsignals.trade/success',
         cancel_url='https://survivalsignals.trade/cancel',
-        metadata={'telegram_user_id': tg_id},
-        subscription_data={'metadata': {'telegram_user_id': tg_id}}
+        metadata={'telegram_user_id': str(telegram_id)}
     )
-    logger.info(f"Created session {session.id} for TG {tg_id}")
+    logger.info(f"Created Checkout Session {session.id} for TG: {telegram_id}")
     return jsonify({'sessionId': session.id})
 
-# Stripe Webhook Endpoint
-@app.route('/webhook/stripe', methods=['GET', 'OPTIONS', 'POST'])
-@app.route('/webhook/stripe/', methods=['GET', 'OPTIONS', 'POST'])
+# Endpoint: Stripe Webhook Receiver
+@app.route('/webhook/stripe', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/webhook/stripe/', methods=['GET', 'POST', 'OPTIONS'])
 def stripe_webhook():
-    logger.debug(f"stripe_webhook invoked, method={request.method}")
+    # Health-check and preflight
     if request.method in ('GET', 'OPTIONS'):
-        logger.debug("Health-check or CORS preflight request")
         return jsonify({'status': 'ok'}), 200
 
     payload = request.get_data(as_text=True)
-    logger.debug(f"Raw payload: {payload}")
     sig_header = request.headers.get('Stripe-Signature')
-    logger.debug(f"Stripe-Signature header: {sig_header}")
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
-        logger.info(f"Constructed Stripe event id={event.id} type={event['type']}")
     except Exception as e:
-        logger.error(f"Webhook signature verification failed: {e}")
+        logger.error(f"Signature verification failed: {e}")
+        send_signal(f"❌ Signature verification failed: {e}")
         abort(400)
 
     if already_processed(event.id):
+        logger.info(f"Skipping duplicate event {event.id}")
         return '', 200
 
     etype = event['type']
     logger.info(f"Handling event: {etype}")
     send_signal(f"✨ Event: {etype}")
 
-    # Handle checkout session completed
+    # Handle checkout.session.completed
     if etype in ('checkout.session.completed', 'checkout.session.async_payment_succeeded'):
         sess = event['data']['object']
         tg = sess['metadata'].get('telegram_user_id')
-        logger.info(f"checkout.session event, telegram_user_id={tg}")
+        logger.info(f"checkout completed for TG: {tg}")
         if tg:
             try:
                 link = create_one_time_invite()
-                send_dm(tg, f"🎉 Your invite link: {link}")
+                send_dm(tg, f"🎉 Your one-time invite link: {link}")
             except Exception as e:
-                logger.error(f"Error creating or sending invite: {e}")
+                logger.error(f"Invite creation error: {e}")
+                send_signal(f"❌ Invite creation error: {e}")
 
-    # Handle invoice.paid
+    # Handle recurring invoice.paid
     elif etype == 'invoice.paid':
         inv = event['data']['object']
-        logger.info(f"Invoice paid event data keys: {list(inv.keys())}")
-        tg = inv.get('metadata', {}).get('telegram_user_id')
-        logger.debug(f"Primary metadata telegram_user_id: {tg}")
-        subscription_id = inv.get('parent', {}).get('subscription_details', {}).get('subscription')
-        logger.debug(f"Parent subscription_id: {subscription_id}")
-        if not tg and not subscription_id:
-            for line in inv.get('lines', {}).get('data', []):
-                subscription_id = line.get('parent', {}).get('subscription_item_details', {}).get('subscription')
-                if subscription_id:
-                    logger.debug(f"Found subscription_id in line: {subscription_id}")
-                    break
-        if not tg and subscription_id:
-            try:
-                sub = stripe.Subscription.retrieve(subscription_id)
-                tg = sub.metadata.get('telegram_user_id')
-                logger.info(f"Retrieved telegram_user_id from subscription metadata: {tg}")
-            except Exception as e:
-                logger.error(f"Failed to retrieve subscription: {e}")
-        logger.info(f"Final telegram_user_id determined: {tg}")
+        tg = inv['metadata'].get('telegram_user_id')
+        logger.info(f"invoice.paid for TG: {tg}")
         if tg:
             try:
                 link = create_one_time_invite()
                 send_dm(tg, f"🔄 Renewal invite link: {link}")
             except Exception as e:
-                logger.error(f"Error sending renewal invite: {e}")
+                logger.error(f"Renewal invite error: {e}")
                 send_signal(f"❌ Renewal invite error: {e}")
 
     # Handle payment failures
     elif etype == 'invoice.payment_failed':
         inv = event['data']['object']
-        tg = inv.get('metadata', {}).get('telegram_user_id')
-        logger.info(f"invoice.payment_failed, telegram_user_id={tg}")
+        tg = inv['metadata'].get('telegram_user_id')
+        logger.info(f"invoice.payment_failed for TG: {tg}")
         if tg:
             send_dm(tg, "❗️ Your payment failed; please update your payment method.")
 
@@ -196,13 +165,12 @@ def stripe_webhook():
     elif etype == 'customer.subscription.updated':
         sub = event['data']['object']
         status = sub.get('status')
-        tg = sub.get('metadata', {}).get('telegram_user_id')
-        logger.info(f"customer.subscription.updated, status={status}, telegram_user_id={tg}")
+        tg = sub['metadata'].get('telegram_user_id')
+        logger.info(f"subscription.updated status={status} for TG: {tg}")
         if tg and status in ('canceled', 'unpaid'):
             send_dm(tg, "🔒 Your subscription has ended; alerts paused.")
 
     return '', 200
 
 if __name__ == '__main__':
-    logger.info("Starting Flask app")
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
