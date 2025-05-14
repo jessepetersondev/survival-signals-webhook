@@ -111,6 +111,7 @@ def create_checkout_session():
         metadata={'telegram_user_id': tg_id},
         subscription_data={'metadata': {'telegram_user_id': tg_id}}
     )
+    # Important log: show session ID and associated Telegram ID
     logger.info(f"Created session {session.id} for TG {tg_id}")
     return jsonify({'sessionId': session.id})
 
