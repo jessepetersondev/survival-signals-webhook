@@ -9,7 +9,7 @@ from flask_cors import CORS
 
 # Configure detailed logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
-logger = logging.getLogger('survival-signals')
+logger = logging.getLogger('app')
 
 # Load environment variables
 load_dotenv()
@@ -157,20 +157,16 @@ def stripe_webhook():
     elif etype == 'invoice.paid':
         inv = event['data']['object']
         logger.info(f"Invoice paid event data keys: {list(inv.keys())}")
-        # Primary metadata
         tg = inv.get('metadata', {}).get('telegram_user_id')
         logger.debug(f"Primary metadata telegram_user_id: {tg}")
-        # Fallback: subscription_id from parent
         subscription_id = inv.get('parent', {}).get('subscription_details', {}).get('subscription')
         logger.debug(f"Parent subscription_id: {subscription_id}")
-        # Fallback: lines subscription_item_details
         if not tg and not subscription_id:
             for line in inv.get('lines', {}).get('data', []):
                 subscription_id = line.get('parent', {}).get('subscription_item_details', {}).get('subscription')
                 if subscription_id:
                     logger.debug(f"Found subscription_id in line: {subscription_id}")
                     break
-        # Retrieve from subscription metadata if needed
         if not tg and subscription_id:
             try:
                 sub = stripe.Subscription.retrieve(subscription_id)
@@ -178,7 +174,6 @@ def stripe_webhook():
                 logger.info(f"Retrieved telegram_user_id from subscription metadata: {tg}")
             except Exception as e:
                 logger.error(f"Failed to retrieve subscription: {e}")
-
         logger.info(f"Final telegram_user_id determined: {tg}")
         if tg:
             try:
