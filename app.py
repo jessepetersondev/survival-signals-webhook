@@ -26,19 +26,43 @@ def already_processed(event_id):
     processed_events.add(event_id)
     return False
 
+# Helper: Sanitize and extract raw bot token
+def get_bot_token():
+    token = TG_BOT_TOKEN or ''
+    # Remove leading 'bot' if present
+    if token.lower().startswith('bot'):
+        token = token[3:]
+    return token
+
 # Utility: Create a single-use Telegram invite link
 def create_one_time_invite():
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/createChatInviteLink"
+    token = get_bot_token()
+    url = f"https://api.telegram.org/bot{token}/createChatInviteLink"
     payload = { 'chat_id': TG_CHAT_ID, 'member_limit': 1 }
     resp = requests.post(url, json=payload)
-    resp.raise_for_status()
-    return resp.json()['result']['invite_link']
+    # In case of API-level error, log JSON
+    if resp.status_code != 200:
+        send_signal(f"Failed to create invite link: HTTP {resp.status_code} - {resp.text}")
+        resp.raise_for_status()
+    data = resp.json()
+    if not data.get('ok'):
+        send_signal(f"Telegram API error (createChatInviteLink): {data}")
+        raise Exception(f"Telegram API error: {data.get('description')}")
+    return data['result']['invite_link']
 
 # Utility: Send a DM to a Telegram user
 def send_dm(telegram_id, text):
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    token = get_bot_token()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     resp = requests.post(url, json={ 'chat_id': telegram_id, 'text': text })
-    resp.raise_for_status()
+    # Log on non-200 HTTP
+    if resp.status_code != 200:
+        send_signal(f"Failed to send DM: HTTP {resp.status_code} - {resp.text}")
+        resp.raise_for_status()
+    data = resp.json()
+    if not data.get('ok'):
+        send_signal(f"Telegram API error (sendMessage): {data}")
+        raise Exception(f"Telegram API error: {data.get('description')}")
 
 # Endpoint: Create Checkout Session
 @app.route('/create-checkout-session', methods=['POST'])
