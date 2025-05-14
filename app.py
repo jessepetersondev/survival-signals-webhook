@@ -131,12 +131,41 @@ def stripe_webhook():
     # Handle invoice.paid
     elif et == 'invoice.paid':
         inv = event['data']['object']
-        billing_reason = inv.get('billing_reason')
-        logger.info(f"invoice.paid billing_reason: {billing_reason}")
-        # Skip initial invoice for subscription creation (handled in checkout.session.completed)
-        if billing_reason == 'subscription_create':
-            logger.info("Skipping initial invoice.paid for subscription_create")
-            return '',200
+        # Invoice paid: initial and recurring
+        tg = inv.get('metadata', {}).get('telegram_user_id')
+        subscription_id = None
+        # Try parent subscription_details
+        parent_sub = inv.get('parent', {}).get('subscription_details', {})
+        subscription_id = parent_sub.get('subscription') if not tg else None
+        if subscription_id:
+            send_signal(f"🔍 invoice.paid fallback using invoice.parent.subscription_details: {subscription_id}")
+        # Try lines subscription_item_details
+        if not tg and not subscription_id:
+            lines = inv.get('lines', {}).get('data', [])
+            for line in lines:
+                sub_item = line.get('parent', {}).get('subscription_item_details', {})
+                subscription_id = sub_item.get('subscription')
+                if subscription_id:
+                    send_signal(f"🔍 invoice.paid fallback found subscription in line.parent.subscription_item_details: {subscription_id}")
+                    break
+        # Retrieve TG ID from subscription metadata if needed
+        if not tg and subscription_id:
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                tg = sub.metadata.get('telegram_user_id')
+                send_signal(f"🔍 Retrieved TG from Subscription metadata: {tg}")
+            except Exception as e:
+                logger.error(f"Subscription retrieve failed: {e}")
+                send_signal(f"❌ Subscription retrieve failed: {e}")
+        logger.info(f"invoice.paid for TG: {tg}")
+        if tg:
+            try:
+                link = create_one_time_invite()
+                send_dm(tg, f"🔄 Renewal invite: {link}")
+            except Exception as e:
+                logger.error(f"Renewal error: {e}")
+                send_signal(f"❌ Renewal invite error: {e}")
+        return '',200
         # 1) Try metadata on invoice directly
         tg = inv.get('metadata', {}).get('telegram_user_id')
         # 2) Fallback: invoice.parent.subscription_details
