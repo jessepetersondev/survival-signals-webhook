@@ -145,15 +145,24 @@ def stripe_webhook():
     logger.info(f"Handling event: {etype}")
     send_signal(f"✨ Event: {etype}")
 
-    # Handle checkout session completed
+        # Handle checkout session completed
     if etype in ('checkout.session.completed', 'checkout.session.async_payment_succeeded'):
         sess = event['data']['object']
         tg = sess['metadata'].get('telegram_user_id')
         logger.info(f"checkout.session event, telegram_user_id={tg}")
         if tg:
             try:
+                # Send initial invite
                 link = create_one_time_invite()
                 send_dm(tg, f"🎉 Your invite link: {link}")
+                # Patch initial invoice metadata so invoice.paid carries TG ID
+                sub_id = sess.get('subscription')
+                if sub_id:
+                    invoices = stripe.Invoice.list(subscription=sub_id, limit=1)
+                    if invoices.data:
+                        inv_id = invoices.data[0].id
+                        stripe.Invoice.modify(inv_id, metadata={'telegram_user_id': tg})
+                        logger.info(f"Patched invoice {inv_id} with telegram_user_id={tg}")
             except Exception as e:
                 logger.error(f"Error creating or sending invite: {e}")
 
