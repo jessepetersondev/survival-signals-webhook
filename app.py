@@ -111,7 +111,7 @@ def create_checkout_session():
         metadata={'telegram_user_id': tg_id},
         subscription_data={'metadata': {'telegram_user_id': tg_id}}
     )
-    logger.info(f"Created Checkout Session {session.id} for TG {tg_id}")
+    logger.info(f"Created session {session.id} for TG {tg_id}")
     return jsonify({'sessionId': session.id})
 
 # Stripe Webhook Endpoint
