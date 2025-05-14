@@ -29,7 +29,17 @@ def already_processed(event_id):
 # Helper: Sanitize and extract raw bot token
 def get_bot_token():
     token = TG_BOT_TOKEN or ''
-    # Remove leading 'bot' if present
+    # If someone provided full URL, extract only the token
+    if token.startswith('http'):
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(token)
+            path = parsed.path  # expected '/bot<token>'
+            if path.lower().startswith('/bot'):
+                token = path[4:]
+        except Exception:
+            pass
+    # Remove leading 'bot' prefix if present
     if token.lower().startswith('bot'):
         token = token[3:]
     return token
