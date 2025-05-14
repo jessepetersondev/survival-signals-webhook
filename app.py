@@ -98,6 +98,7 @@ def create_checkout_session():
     logger.debug("create_checkout_session invoked")
     data = request.json or {}
     tg_id = data.get('telegram_user_id')
+    logger.info(f"Telegram ID!!!!!!!!! {tg_id}")
     logger.debug(f"Payload data: {data}")
     if not tg_id:
         logger.warning("Missing telegram_user_id in request")
@@ -111,7 +112,6 @@ def create_checkout_session():
         metadata={'telegram_user_id': tg_id},
         subscription_data={'metadata': {'telegram_user_id': tg_id}}
     )
-    # Important log: show session ID and associated Telegram ID
     logger.info(f"Created session {session.id} for TG {tg_id}")
     return jsonify({'sessionId': session.id})
 
