@@ -49,18 +49,39 @@ def create_one_time_invite():
     token = get_bot_token()
     url = f"https://api.telegram.org/bot{token}/createChatInviteLink"
     payload = { 'chat_id': TG_CHAT_ID, 'member_limit': 1 }
+    send_signal(f"📨 [create_one_time_invite] URL: {url}, Payload: {payload}")
     resp = requests.post(url, json=payload)
+    send_signal(f"📤 [create_one_time_invite] Response: HTTP {resp.status_code}, Body: {resp.text}")
     # In case of API-level error, log JSON
     if resp.status_code != 200:
-        send_signal(f"Failed to create invite link: HTTP {resp.status_code} - {resp.text}")
+        send_signal(f"❌ [create_one_time_invite] HTTP Error {resp.status_code}: {resp.text}")
         resp.raise_for_status()
     data = resp.json()
     if not data.get('ok'):
-        send_signal(f"Telegram API error (createChatInviteLink): {data}")
+        send_signal(f"❌ [create_one_time_invite] API Error: {data}")
         raise Exception(f"Telegram API error: {data.get('description')}")
+    send_signal(f"✅ [create_one_time_invite] Success, link: {data['result']['invite_link']}")
     return data['result']['invite_link']
 
 # Utility: Send a DM to a Telegram user
+def send_dm(telegram_id, text):
+    token = get_bot_token()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = { 'chat_id': telegram_id, 'text': text }
+    send_signal(f"📨 [send_dm] URL: {url}, Payload: {payload}")
+    resp = requests.post(url, json=payload)
+    send_signal(f"📤 [send_dm] Response: HTTP {resp.status_code}, Body: {resp.text}")
+    # Log on non-200 HTTP
+    if resp.status_code != 200:
+        send_signal(f"❌ [send_dm] HTTP Error {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+    data = resp.json()
+    if not data.get('ok'):
+        send_signal(f"❌ [send_dm] API Error: {data}")
+        raise Exception(f"Telegram API error: {data.get('description')}")
+    send_signal(f"✅ [send_dm] Message sent to {telegram_id}")
+
+# Endpoint: Create Checkout Session
 def send_dm(telegram_id, text):
     token = get_bot_token()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
