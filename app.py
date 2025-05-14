@@ -131,15 +131,20 @@ def stripe_webhook():
     # Handle invoice.paid
     elif et == 'invoice.paid':
         inv = event['data']['object']
+        billing_reason = inv.get('billing_reason')
+        logger.info(f"invoice.paid billing_reason: {billing_reason}")
+        # Skip initial invoice for subscription creation (handled in checkout.session.completed)
+        if billing_reason == 'subscription_create':
+            logger.info("Skipping initial invoice.paid for subscription_create")
+            return '',200
         # 1) Try metadata on invoice directly
         tg = inv.get('metadata', {}).get('telegram_user_id')
         # 2) Fallback: invoice.parent.subscription_details
         subscription_id = None
-        if not tg:
-            parent_sub = inv.get('parent', {}).get('subscription_details', {})
-            subscription_id = parent_sub.get('subscription')
-            if subscription_id:
-                send_signal(f"🔍 invoice.paid fallback using invoice.parent.subscription_details: {subscription_id}")
+        parent_sub = inv.get('parent', {}).get('subscription_details', {})
+        subscription_id = parent_sub.get('subscription') if not tg else None
+        if subscription_id:
+            send_signal(f"🔍 invoice.paid fallback using invoice.parent.subscription_details: {subscription_id}")
         # 3) Fallback: subscription_item_details in lines
         if not tg and not subscription_id:
             lines = inv.get('lines', {}).get('data', [])
@@ -149,7 +154,7 @@ def stripe_webhook():
                 if subscription_id:
                     send_signal(f"🔍 invoice.paid fallback found subscription in line.parent.subscription_item_details: {subscription_id}")
                     break
-        # Retrieve TG ID from subscription metadata if needed
+        # 4) Retrieve TG ID from subscription metadata if needed
         if not tg and subscription_id:
             try:
                 sub = stripe.Subscription.retrieve(subscription_id)
