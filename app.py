@@ -118,6 +118,61 @@ def create_checkout_session():
 
     return jsonify({'sessionId': session.id})
 
+@app.route('/subscription-details', methods=['POST'])
+def subscription_details():
+    data = request.json or {}
+    tg_id = data.get('telegram_user_id')
+    if not tg_id:
+        return jsonify({'error': 'Missing telegram_user_id'}), 400
+
+    # Find their subscription via metadata
+    res = stripe.Subscription.search(
+        query=f"metadata['telegram_user_id']:'{tg_id}'",
+        limit=1
+    )
+    if not res.data:
+        return jsonify({'subscribed': False}), 200
+
+    sub = res.data[0]
+    return jsonify({
+        'subscribed': True,
+        'status':      sub.status,
+        'current_period_end': sub.current_period_end,
+        'price':       sub.items.data[0].price.unit_amount_decimal,
+        'currency':    sub.items.data[0].price.currency,
+        'subscription_id': sub.id
+    })
+
+# Create Stripe Portal Session
+@app.route('/create-portal-session', methods=['POST'])
+def create_portal_session():
+    data = request.json or {}
+    tg_id = data.get("telegram_user_id")
+    if not tg_id:
+        return jsonify({"error": "Missing telegram_user_id"}), 400
+
+    # Search for the subscription whose metadata.telegram_user_id matches
+    try:
+        result = stripe.Subscription.search(
+            query=f"metadata['telegram_user_id']:'{tg_id}'",
+            limit=1
+        )
+    except Exception as e:
+        return jsonify({"error": f"Search failed: {e}"}), 500
+
+    if not result.data:
+        return jsonify({"error": "Subscription not found"}), 404
+
+    subscription = result.data[0]
+    customer_id  = subscription.customer
+
+    # Create a billing portal session for that customer
+    portal = stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url="https://survivalsignals.trade/account"
+    )
+    return jsonify({"url": portal.url})
+
 # Stripe Webhook Endpoint
 @app.route('/webhook/stripe', methods=['GET', 'OPTIONS', 'POST'])
 @app.route('/webhook/stripe/', methods=['GET', 'OPTIONS', 'POST'])
