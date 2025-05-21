@@ -184,27 +184,54 @@ def create_portal_session():
     if not tg_id:
         return jsonify({"error": "Missing telegram_user_id"}), 400
 
-    # Search for the subscription whose metadata.telegram_user_id matches
     try:
+        # Search for the subscription whose metadata.telegram_user_id matches
         result = stripe.Subscription.search(
             query=f"metadata['telegram_user_id']:'{tg_id}'",
             limit=1
         )
+        
+        if not result.data:
+            return jsonify({"error": "Subscription not found"}), 404
+
+        subscription = result.data[0]
+        customer_id = subscription.customer
+
+        try:
+            # Create a billing portal session for that customer
+            # Add configuration_id if available in environment
+            portal_config = os.getenv('STRIPE_PORTAL_CONFIG_ID')
+            portal_args = {
+                'customer': customer_id,
+                'return_url': "https://survivalsignals.trade/account"
+            }
+            
+            # Only add configuration if it's set
+            if portal_config:
+                portal_args['configuration'] = portal_config
+                
+            portal = stripe.billing_portal.Session.create(**portal_args)
+            return jsonify({"url": portal.url})
+            
+        except stripe.error.InvalidRequestError as e:
+            # Handle specific Stripe errors
+            if "No configuration provided" in str(e):
+                logger.error(f"Stripe portal configuration error: {e}")
+                return jsonify({
+                    "error": "Stripe customer portal is not configured. Please contact support.",
+                    "details": "The site administrator needs to configure the Stripe Customer Portal in the Stripe Dashboard.",
+                    "admin_action_required": True
+                }), 503
+            else:
+                # Re-raise for general handling
+                raise
+                
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error creating portal session: {e}")
+        return jsonify({"error": f"Payment service error: {str(e)}"}), 500
     except Exception as e:
-        return jsonify({"error": f"Search failed: {e}"}), 500
-
-    if not result.data:
-        return jsonify({"error": "Subscription not found"}), 404
-
-    subscription = result.data[0]
-    customer_id  = subscription.customer
-
-    # Create a billing portal session for that customer
-    portal = stripe.billing_portal.Session.create(
-        customer=customer_id,
-        return_url="https://survivalsignals.trade/account"
-    )
-    return jsonify({"url": portal.url})
+        logger.error(f"Unexpected error creating portal session: {e}")
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
 
 # Stripe Webhook Endpoint
 @app.route('/webhook/stripe', methods=['GET', 'OPTIONS', 'POST'])
