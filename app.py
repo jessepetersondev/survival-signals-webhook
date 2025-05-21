@@ -2,6 +2,7 @@ import os
 import stripe
 import requests
 import logging
+import json
 from flask import Flask, jsonify, request, abort
 from dotenv import load_dotenv
 from notify_signals import send_signal
@@ -24,6 +25,38 @@ TG_CHAT_ID       = os.getenv('TG_CHAT_ID')
 PRICE_ID         = os.getenv('STRIPE_PRICE_ID', 'price_1RMYrR2X75x3JSfv5Ad0YdRk')
 
 logger.debug(f"Config loaded: TG_CHAT_ID={TG_CHAT_ID}, PRICE_ID={PRICE_ID}")
+
+# Helper function to safely log objects
+def safe_log_object(obj, prefix="Object"):
+    """Safely log an object's properties, handling potential serialization issues"""
+    if obj is None:
+        logger.debug(f"{prefix}: None")
+        return
+        
+    try:
+        # Try to convert to dict if it's a Stripe object
+        if hasattr(obj, 'to_dict'):
+            obj_dict = obj.to_dict()
+        else:
+            obj_dict = dict(obj)
+            
+        # Log the object as JSON
+        logger.debug(f"{prefix}: {json.dumps(obj_dict, indent=2)}")
+    except Exception as e:
+        # If conversion fails, log available attributes
+        logger.debug(f"{prefix} (conversion failed: {e})")
+        try:
+            attrs = dir(obj)
+            values = {}
+            for attr in attrs:
+                if not attr.startswith('_') and not callable(getattr(obj, attr)):
+                    try:
+                        values[attr] = getattr(obj, attr)
+                    except Exception:
+                        values[attr] = "ERROR: Could not access attribute"
+            logger.debug(f"{prefix} attributes: {values}")
+        except Exception as e2:
+            logger.debug(f"Could not log {prefix} attributes: {e2}")
 
 # Idempotency store
 processed_events = set()
@@ -122,58 +155,105 @@ def create_checkout_session():
 def subscription_details():
     data = request.json or {}
     tg_id = data.get('telegram_user_id')
+    logger.info(f"subscription_details called with telegram_user_id: {tg_id}")
+    
     if not tg_id:
+        logger.warning("Missing telegram_user_id in request")
         return jsonify({'error': 'Missing telegram_user_id'}), 400
 
     try:
         # Find their subscription via metadata
+        logger.info(f"Searching for subscription with metadata['telegram_user_id']: {tg_id}")
         res = stripe.Subscription.search(
             query=f"metadata['telegram_user_id']:'{tg_id}'",
             limit=1
         )
         
+        logger.info(f"Search returned {len(res.data)} results")
+        
         if not res.data:
+            logger.info(f"No subscription found for telegram_user_id: {tg_id}")
             return jsonify({'subscribed': False}), 200
 
         sub = res.data[0]
+        logger.info(f"Found subscription: {sub.id}")
+        
+        # Log the entire subscription object for debugging
+        logger.info(f"SUBSCRIPTION DETAILS FOR {sub.id}:")
+        safe_log_object(sub, f"Subscription {sub.id}")
+        
+        # Log available top-level attributes
+        logger.info(f"Available top-level attributes for subscription {sub.id}:")
+        for attr in dir(sub):
+            if not attr.startswith('_') and not callable(getattr(sub, attr, None)):
+                try:
+                    value = getattr(sub, attr)
+                    logger.info(f"  - {attr}: {value}")
+                except Exception as e:
+                    logger.info(f"  - {attr}: ERROR accessing ({e})")
         
         # Safely get subscription attributes with fallbacks
         try:
             current_period_end = getattr(sub, 'current_period_end', None)
-        except (AttributeError, KeyError):
-            logger.warning(f"current_period_end not found in subscription {sub.id}")
+            logger.info(f"current_period_end: {current_period_end}")
+        except (AttributeError, KeyError) as e:
+            logger.warning(f"current_period_end not found in subscription {sub.id}: {e}")
             current_period_end = None
             
         try:
             status = getattr(sub, 'status', 'unknown')
-        except (AttributeError, KeyError):
-            logger.warning(f"status not found in subscription {sub.id}")
+            logger.info(f"status: {status}")
+        except (AttributeError, KeyError) as e:
+            logger.warning(f"status not found in subscription {sub.id}: {e}")
             status = 'unknown'
+        
+        # Log items data if available
+        if hasattr(sub, 'items') and hasattr(sub.items, 'data'):
+            logger.info(f"Subscription has {len(sub.items.data)} items")
+            for i, item in enumerate(sub.items.data):
+                safe_log_object(item, f"Subscription item {i}")
+                if hasattr(item, 'price'):
+                    safe_log_object(item.price, f"Price for item {i}")
+        else:
+            logger.warning(f"No items data found in subscription {sub.id}")
             
         try:
-            price = sub.items.data[0].price.unit_amount_decimal
-        except (AttributeError, KeyError, IndexError):
-            logger.warning(f"price not found in subscription {sub.id}")
+            if hasattr(sub, 'items') and hasattr(sub.items, 'data') and len(sub.items.data) > 0:
+                price = sub.items.data[0].price.unit_amount_decimal
+                logger.info(f"price: {price}")
+            else:
+                logger.warning(f"No items data available to extract price")
+                price = None
+        except (AttributeError, KeyError, IndexError) as e:
+            logger.warning(f"price not found in subscription {sub.id}: {e}")
             price = None
             
         try:
-            currency = sub.items.data[0].price.currency
-        except (AttributeError, KeyError, IndexError):
-            logger.warning(f"currency not found in subscription {sub.id}")
+            if hasattr(sub, 'items') and hasattr(sub.items, 'data') and len(sub.items.data) > 0:
+                currency = sub.items.data[0].price.currency
+                logger.info(f"currency: {currency}")
+            else:
+                logger.warning(f"No items data available to extract currency")
+                currency = 'usd'
+        except (AttributeError, KeyError, IndexError) as e:
+            logger.warning(f"currency not found in subscription {sub.id}: {e}")
             currency = 'usd'
             
         # Return subscription details with safe values
-        return jsonify({
+        response_data = {
             'subscribed': True,
             'status': status,
             'current_period_end': current_period_end,
             'price': price,
             'currency': currency,
             'subscription_id': sub.id
-        })
+        }
+        
+        logger.info(f"Returning subscription details: {response_data}")
+        return jsonify(response_data)
         
     except Exception as e:
-        logger.error(f"Error fetching subscription details: {e}")
+        logger.error(f"Error fetching subscription details: {e}", exc_info=True)
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 # Create Stripe Portal Session
@@ -181,26 +261,46 @@ def subscription_details():
 def create_portal_session():
     data = request.json or {}
     tg_id = data.get("telegram_user_id")
+    logger.info(f"create_portal_session called with telegram_user_id: {tg_id}")
+    
     if not tg_id:
+        logger.warning("Missing telegram_user_id in request")
         return jsonify({"error": "Missing telegram_user_id"}), 400
 
     try:
         # Search for the subscription whose metadata.telegram_user_id matches
+        logger.info(f"Searching for subscription with metadata['telegram_user_id']: {tg_id}")
         result = stripe.Subscription.search(
             query=f"metadata['telegram_user_id']:'{tg_id}'",
             limit=1
         )
         
+        logger.info(f"Search returned {len(result.data)} results")
+        
         if not result.data:
+            logger.warning(f"No subscription found for telegram_user_id: {tg_id}")
             return jsonify({"error": "Subscription not found"}), 404
 
         subscription = result.data[0]
-        customer_id = subscription.customer
+        logger.info(f"Found subscription: {subscription.id}")
+        
+        # Log the subscription object
+        safe_log_object(subscription, f"Portal subscription {subscription.id}")
+        
+        # Get customer ID
+        try:
+            customer_id = subscription.customer
+            logger.info(f"Customer ID: {customer_id}")
+        except Exception as e:
+            logger.error(f"Error getting customer ID: {e}")
+            return jsonify({"error": "Could not determine customer ID"}), 500
 
         try:
             # Create a billing portal session for that customer
             # Add configuration_id if available in environment
             portal_config = os.getenv('STRIPE_PORTAL_CONFIG_ID')
+            logger.info(f"Portal configuration ID from env: {portal_config}")
+            
             portal_args = {
                 'customer': customer_id,
                 'return_url': "https://survivalsignals.trade/account"
@@ -210,28 +310,46 @@ def create_portal_session():
             if portal_config:
                 portal_args['configuration'] = portal_config
                 
+            logger.info(f"Creating portal session with args: {portal_args}")
             portal = stripe.billing_portal.Session.create(**portal_args)
+            
+            logger.info(f"Portal session created: {portal.id}, URL: {portal.url}")
             return jsonify({"url": portal.url})
             
         except stripe.error.InvalidRequestError as e:
             # Handle specific Stripe errors
-            if "No configuration provided" in str(e):
+            error_message = str(e)
+            logger.error(f"Stripe portal InvalidRequestError: {error_message}")
+            
+            if "No configuration provided" in error_message:
                 logger.error(f"Stripe portal configuration error: {e}")
                 return jsonify({
                     "error": "Stripe customer portal is not configured. Please contact support.",
                     "details": "The site administrator needs to configure the Stripe Customer Portal in the Stripe Dashboard.",
-                    "admin_action_required": True
+                    "admin_action_required": True,
+                    "stripe_error": error_message
                 }), 503
             else:
-                # Re-raise for general handling
-                raise
+                # Return detailed error for other invalid request errors
+                return jsonify({
+                    "error": "Payment service configuration error",
+                    "details": error_message,
+                    "admin_action_required": True
+                }), 500
                 
     except stripe.error.StripeError as e:
-        logger.error(f"Stripe error creating portal session: {e}")
-        return jsonify({"error": f"Payment service error: {str(e)}"}), 500
+        error_message = str(e)
+        logger.error(f"Stripe error creating portal session: {error_message}")
+        return jsonify({
+            "error": "Payment service error",
+            "details": error_message
+        }), 500
     except Exception as e:
-        logger.error(f"Unexpected error creating portal session: {e}")
-        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
+        logger.error(f"Unexpected error creating portal session: {e}", exc_info=True)
+        return jsonify({
+            "error": "An unexpected error occurred. Please try again later.",
+            "details": str(e)
+        }), 500
 
 # Stripe Webhook Endpoint
 @app.route('/webhook/stripe', methods=['GET', 'OPTIONS', 'POST'])
