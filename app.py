@@ -125,23 +125,56 @@ def subscription_details():
     if not tg_id:
         return jsonify({'error': 'Missing telegram_user_id'}), 400
 
-    # Find their subscription via metadata
-    res = stripe.Subscription.search(
-        query=f"metadata['telegram_user_id']:'{tg_id}'",
-        limit=1
-    )
-    if not res.data:
-        return jsonify({'subscribed': False}), 200
+    try:
+        # Find their subscription via metadata
+        res = stripe.Subscription.search(
+            query=f"metadata['telegram_user_id']:'{tg_id}'",
+            limit=1
+        )
+        
+        if not res.data:
+            return jsonify({'subscribed': False}), 200
 
-    sub = res.data[0]
-    return jsonify({
-        'subscribed': True,
-        'status':      sub.status,
-        'current_period_end': sub.current_period_end,
-        'price':       sub.items.data[0].price.unit_amount_decimal,
-        'currency':    sub.items.data[0].price.currency,
-        'subscription_id': sub.id
-    })
+        sub = res.data[0]
+        
+        # Safely get subscription attributes with fallbacks
+        try:
+            current_period_end = getattr(sub, 'current_period_end', None)
+        except (AttributeError, KeyError):
+            logger.warning(f"current_period_end not found in subscription {sub.id}")
+            current_period_end = None
+            
+        try:
+            status = getattr(sub, 'status', 'unknown')
+        except (AttributeError, KeyError):
+            logger.warning(f"status not found in subscription {sub.id}")
+            status = 'unknown'
+            
+        try:
+            price = sub.items.data[0].price.unit_amount_decimal
+        except (AttributeError, KeyError, IndexError):
+            logger.warning(f"price not found in subscription {sub.id}")
+            price = None
+            
+        try:
+            currency = sub.items.data[0].price.currency
+        except (AttributeError, KeyError, IndexError):
+            logger.warning(f"currency not found in subscription {sub.id}")
+            currency = 'usd'
+            
+        # Return subscription details with safe values
+        return jsonify({
+            'subscribed': True,
+            'status': status,
+            'current_period_end': current_period_end,
+            'price': price,
+            'currency': currency,
+            'subscription_id': sub.id
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching subscription details: {e}")
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 # Create Stripe Portal Session
 @app.route('/create-portal-session', methods=['POST'])
