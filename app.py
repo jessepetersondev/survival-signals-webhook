@@ -15,14 +15,17 @@ logger = logging.getLogger('app')
 # Load environment variables
 load_dotenv()
 app = Flask(__name__)
-CORS(app, origins=["https://survivalsignals.trade"], supports_credentials=True)
+CORS(app, origins=[
+    "https://survivalsignals.trade",
+    "https://www.survivalsignals.trade"
+], methods=["POST", "GET"], supports_credentials=True)
 
 # Configuration
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 WEBHOOK_SECRET   = os.getenv('STRIPE_WEBHOOK_SECRET')
 TG_BOT_TOKEN     = os.getenv('TG_BOT_TOKEN')
 TG_CHAT_ID       = os.getenv('TG_CHAT_ID')
-PRICE_ID         = os.getenv('STRIPE_PRICE_ID', 'price_1RMYrR2X75x3JSfv5Ad0YdRk')
+PRICE_ID         = os.getenv('STRIPE_PRICE_ID')
 
 logger.debug(f"Config loaded: TG_CHAT_ID={TG_CHAT_ID}, PRICE_ID={PRICE_ID}")
 
@@ -124,6 +127,51 @@ def send_dm(telegram_id, text):
         logger.error(f"Telegram API sendMessage error: {data}")
         raise Exception(data.get('description'))
     logger.info(f"DM successfully sent to {telegram_id}")
+
+# Remove user from Telegram group
+def remove_from_telegram_group(telegram_id):
+    logger.info(f"Removing user {telegram_id} from Telegram group {TG_CHAT_ID}")
+    token = get_bot_token()
+    url = f"https://api.telegram.org/bot{token}/banChatMember"
+    
+    payload = {
+        'chat_id': TG_CHAT_ID,
+        'user_id': telegram_id,
+        'revoke_messages': False  # Don't delete their messages
+    }
+    
+    logger.debug(f"Calling Telegram API: POST {url} payload={payload}")
+    
+    try:
+        resp = requests.post(url, json=payload)
+        logger.debug(f"Telegram banChatMember response: HTTP {resp.status_code} {resp.text}")
+        
+        if resp.status_code != 200:
+            logger.error(f"Remove user HTTP error {resp.status_code}: {resp.text}")
+            return False
+            
+        data = resp.json()
+        if not data.get('ok'):
+            logger.error(f"Telegram API banChatMember error: {data}")
+            return False
+            
+        # Immediately unban to allow them to rejoin if they resubscribe
+        unban_url = f"https://api.telegram.org/bot{token}/unbanChatMember"
+        unban_payload = {
+            'chat_id': TG_CHAT_ID,
+            'user_id': telegram_id,
+            'only_if_banned': True
+        }
+        
+        unban_resp = requests.post(unban_url, json=unban_payload)
+        logger.debug(f"Telegram unbanChatMember response: HTTP {unban_resp.status_code} {unban_resp.text}")
+        
+        logger.info(f"Successfully removed user {telegram_id} from group {TG_CHAT_ID}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error removing user from Telegram group: {e}", exc_info=True)
+        return False
 
 # Create Stripe Checkout Session
 @app.route('/create-checkout-session', methods=['POST'])
@@ -378,7 +426,7 @@ def stripe_webhook():
     logger.info(f"Handling event: {etype}")
     send_signal(f"✨ Event: {etype}")
 
-        # Handle checkout session completed
+    # Handle checkout session completed
     if etype in ('checkout.session.completed', 'checkout.session.async_payment_succeeded'):
         sess = event['data']['object']
         tg = sess['metadata'].get('telegram_user_id')
@@ -442,6 +490,16 @@ def stripe_webhook():
         logger.info(f"invoice.payment_failed, telegram_user_id={tg}")
         if tg:
             send_dm(tg, "❗️ Your payment failed; please update your payment method.")
+            
+            # Remove user from group on payment failure
+            try:
+                logger.info(f"Removing user {tg} from Telegram group due to payment failure")
+                if remove_from_telegram_group(tg):
+                    send_dm(tg, "🔒 You've been removed from the group due to payment failure. Please update your payment method to regain access.")
+                    send_signal(f"👋 User {tg} removed from group due to payment failure")
+            except Exception as e:
+                logger.error(f"Error removing user from Telegram group: {e}")
+                send_signal(f"❌ Error removing user {tg} from group: {e}")
 
     # Handle subscription updates
     elif etype == 'customer.subscription.updated':
@@ -449,8 +507,41 @@ def stripe_webhook():
         status = sub.get('status')
         tg = sub.get('metadata', {}).get('telegram_user_id')
         logger.info(f"customer.subscription.updated, status={status}, telegram_user_id={tg}")
+        
+        # Check for cancellation or unpaid status
         if tg and status in ('canceled', 'unpaid'):
+            # Send notification to user
             send_dm(tg, "🔒 Your subscription has ended; alerts paused.")
+            
+            # Remove user from Telegram group
+            try:
+                logger.info(f"Removing user {tg} from Telegram group due to subscription {status}")
+                if remove_from_telegram_group(tg):
+                    send_dm(tg, "👋 You've been removed from the Signals group. Resubscribe anytime to regain access.")
+                    send_signal(f"👋 User {tg} removed from group due to subscription {status}")
+            except Exception as e:
+                logger.error(f"Error removing user from Telegram group: {e}")
+                send_signal(f"❌ Error removing user {tg} from group: {e}")
+    
+    # Handle subscription deletion
+    elif etype == 'customer.subscription.deleted':
+        sub = event['data']['object']
+        tg = sub.get('metadata', {}).get('telegram_user_id')
+        logger.info(f"customer.subscription.deleted, telegram_user_id={tg}")
+        
+        if tg:
+            # Send notification to user
+            send_dm(tg, "🔒 Your subscription has been deleted; service access revoked.")
+            
+            # Remove user from Telegram group
+            try:
+                logger.info(f"Removing user {tg} from Telegram group due to subscription deletion")
+                if remove_from_telegram_group(tg):
+                    send_dm(tg, "👋 You've been removed from the Signals group. Resubscribe anytime to regain access.")
+                    send_signal(f"👋 User {tg} removed from group due to subscription deletion")
+            except Exception as e:
+                logger.error(f"Error removing user from Telegram group: {e}")
+                send_signal(f"❌ Error removing user {tg} from group: {e}")
 
     return '', 200
 
