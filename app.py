@@ -3,10 +3,14 @@ import stripe
 import requests
 import logging
 import json
-from flask import Flask, jsonify, request, abort
+import sys
+from flask import Flask, jsonify, request, abort, Response
 from dotenv import load_dotenv
 from notify_signals import send_signal
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Configure detailed logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
@@ -15,17 +19,48 @@ logger = logging.getLogger('app')
 # Load environment variables
 load_dotenv()
 app = Flask(__name__)
+
+# Apply ProxyFix to ensure correct client IP detection behind proxies
+app.wsgi_app = ProxyFix(app, x_for=1, x_proto=1, x_host=1)
+
+# Configure CORS
 CORS(app, origins=[
     "https://survivalsignals.trade",
     "https://www.survivalsignals.trade"
 ], methods=["POST", "GET"], supports_credentials=True)
 
+# Configure rate limiting
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri=os.getenv("REDIS_URL", "memory://"),
+    strategy="fixed-window"
+)
+
+# Set maximum request size (16KB)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024
+
 # Configuration
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
-WEBHOOK_SECRET   = os.getenv('STRIPE_WEBHOOK_SECRET')
-TG_BOT_TOKEN     = os.getenv('TG_BOT_TOKEN')
-TG_CHAT_ID       = os.getenv('TG_CHAT_ID')
-PRICE_ID         = os.getenv('STRIPE_PRICE_ID')
+WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN')
+TG_CHAT_ID = os.getenv('TG_CHAT_ID')
+PRICE_ID = os.getenv('STRIPE_PRICE_ID')
+
+# Validate required environment variables
+required_env_vars = [
+    'STRIPE_SECRET_KEY', 
+    'STRIPE_WEBHOOK_SECRET', 
+    'TG_BOT_TOKEN', 
+    'TG_CHAT_ID', 
+    'STRIPE_PRICE_ID'
+]
+
+missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+if missing_vars:
+    logger.critical(f"Missing required environment variables: {', '.join(missing_vars)}")
+    sys.exit(1)
 
 logger.debug(f"Config loaded: TG_CHAT_ID={TG_CHAT_ID}, PRICE_ID={PRICE_ID}")
 
@@ -61,7 +96,7 @@ def safe_log_object(obj, prefix="Object"):
         except Exception as e2:
             logger.debug(f"Could not log {prefix} attributes: {e2}")
 
-# Idempotency store
+# Idempotency store - in production, replace with Redis or database
 processed_events = set()
 def already_processed(event_id):
     logger.debug(f"Checking idempotency for event {event_id}")
@@ -75,19 +110,22 @@ def already_processed(event_id):
 # Extract raw bot token
 def get_bot_token():
     token = TG_BOT_TOKEN or ''
-    logger.debug(f"Raw TG_BOT_TOKEN: {token}")
+    # Mask token in logs for security
+    masked_token = token[:4] + "..." + token[-4:] if len(token) > 8 else "***"
+    logger.debug(f"Raw TG_BOT_TOKEN: {masked_token}")
+    
     if token.startswith('http'):
         try:
             from urllib.parse import urlparse
             path = urlparse(token).path
             if path.lower().startswith('/bot'):
                 token = path[4:]
-                logger.debug(f"Extracted token from URL: {token}")
+                logger.debug(f"Extracted token from URL")
         except Exception as e:
             logger.error(f"Error parsing bot token URL: {e}")
     if token.lower().startswith('bot'):
         token = token[3:]
-        logger.debug(f"Stripped 'bot' prefix, token now: {token}")
+        logger.debug(f"Stripped 'bot' prefix from token")
     return token
 
 # Create a one-time invite link
@@ -97,39 +135,80 @@ def create_one_time_invite():
     url = f"https://api.telegram.org/bot{token}/createChatInviteLink"
     payload = {'chat_id': TG_CHAT_ID, 'member_limit': 1}
     logger.debug(f"Calling Telegram API: POST {url} payload={payload}")
-    resp = requests.post(url, json=payload)
-    logger.debug(f"Telegram response: HTTP {resp.status_code} {resp.text}")
-    if resp.status_code != 200:
-        logger.error(f"Invite HTTP error {resp.status_code}: {resp.text}")
-        resp.raise_for_status()
-    data = resp.json()
-    if not data.get('ok'):
-        logger.error(f"Telegram API createChatInviteLink error: {data}")
-        raise Exception(data.get('description'))
-    link = data['result']['invite_link']
-    logger.info(f"Generated invite link: {link}")
-    return link
+    
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        logger.debug(f"Telegram response: HTTP {resp.status_code} {resp.text}")
+        
+        if resp.status_code != 200:
+            logger.error(f"Invite HTTP error {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
+            
+        data = resp.json()
+        if not data.get('ok'):
+            logger.error(f"Telegram API createChatInviteLink error: {data}")
+            raise Exception(data.get('description'))
+            
+        link = data['result']['invite_link']
+        logger.info(f"Generated invite link: {link}")
+        return link
+    except requests.exceptions.Timeout:
+        logger.error("Timeout while creating invite link")
+        raise Exception("Timeout while creating invite link")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error while creating invite link: {e}")
+        raise
 
 # Send a direct message via Telegram
 def send_dm(telegram_id, text):
+    # Validate inputs
+    if not telegram_id:
+        logger.error("Missing telegram_id in send_dm")
+        raise ValueError("telegram_id is required")
+        
+    if not text:
+        logger.error("Missing text in send_dm")
+        raise ValueError("text is required")
+        
+    # Truncate message if too long
+    if len(text) > 4000:
+        logger.warning(f"Message too long ({len(text)} chars), truncating to 4000 chars")
+        text = text[:3997] + "..."
+    
     logger.debug(f"Entering send_dm for TG {telegram_id}")
     token = get_bot_token()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {'chat_id': telegram_id, 'text': text}
     logger.debug(f"Calling Telegram API: POST {url} payload={payload}")
-    resp = requests.post(url, json=payload)
-    logger.debug(f"Telegram sendMessage response: HTTP {resp.status_code} {resp.text}")
-    if resp.status_code != 200:
-        logger.error(f"DM HTTP error {resp.status_code}: {resp.text}")
-        resp.raise_for_status()
-    data = resp.json()
-    if not data.get('ok'):
-        logger.error(f"Telegram API sendMessage error: {data}")
-        raise Exception(data.get('description'))
-    logger.info(f"DM successfully sent to {telegram_id}")
+    
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        logger.debug(f"Telegram sendMessage response: HTTP {resp.status_code} {resp.text}")
+        
+        if resp.status_code != 200:
+            logger.error(f"DM HTTP error {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
+            
+        data = resp.json()
+        if not data.get('ok'):
+            logger.error(f"Telegram API sendMessage error: {data}")
+            raise Exception(data.get('description'))
+            
+        logger.info(f"DM successfully sent to {telegram_id}")
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout sending DM to {telegram_id}")
+        raise Exception(f"Timeout sending DM to {telegram_id}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error sending DM to {telegram_id}: {e}")
+        raise
 
 # Remove user from Telegram group
 def remove_from_telegram_group(telegram_id):
+    # Validate input
+    if not telegram_id:
+        logger.error("Missing telegram_id in remove_from_telegram_group")
+        return False
+        
     logger.info(f"Removing user {telegram_id} from Telegram group {TG_CHAT_ID}")
     token = get_bot_token()
     url = f"https://api.telegram.org/bot{token}/banChatMember"
@@ -143,7 +222,7 @@ def remove_from_telegram_group(telegram_id):
     logger.debug(f"Calling Telegram API: POST {url} payload={payload}")
     
     try:
-        resp = requests.post(url, json=payload)
+        resp = requests.post(url, json=payload, timeout=10)
         logger.debug(f"Telegram banChatMember response: HTTP {resp.status_code} {resp.text}")
         
         if resp.status_code != 200:
@@ -163,51 +242,152 @@ def remove_from_telegram_group(telegram_id):
             'only_if_banned': True
         }
         
-        unban_resp = requests.post(unban_url, json=unban_payload)
+        unban_resp = requests.post(unban_url, json=unban_payload, timeout=10)
         logger.debug(f"Telegram unbanChatMember response: HTTP {unban_resp.status_code} {unban_resp.text}")
         
         logger.info(f"Successfully removed user {telegram_id} from group {TG_CHAT_ID}")
         return True
         
-    except Exception as e:
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout removing user {telegram_id} from group")
+        return False
+    except requests.exceptions.RequestException as e:
         logger.error(f"Error removing user from Telegram group: {e}", exc_info=True)
         return False
 
+# Input validation helpers
+def validate_telegram_id(tg_id):
+    """Validate Telegram user ID"""
+    if not tg_id:
+        return False
+        
+    # Telegram IDs are numeric
+    try:
+        int(tg_id)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+# Health check endpoint
+@app.route('/health', methods=['GET'])
+def health_check():
+    # Check connections to external services
+    health = {
+        "status": "ok",
+        "stripe": "unknown",
+        "telegram": "unknown"
+    }
+    
+    # Check Stripe connection
+    try:
+        stripe.Balance.retrieve()
+        health["stripe"] = "ok"
+    except Exception as e:
+        health["stripe"] = f"error: {str(e)}"
+        health["status"] = "degraded"
+        
+    # Check Telegram connection
+    try:
+        token = get_bot_token()
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getMe",
+            timeout=5
+        )
+        if resp.status_code == 200:
+            health["telegram"] = "ok"
+        else:
+            health["telegram"] = f"error: HTTP {resp.status_code}"
+            health["status"] = "degraded"
+    except Exception as e:
+        health["telegram"] = f"error: {str(e)}"
+        health["status"] = "degraded"
+    
+    # Overall status
+    if health["status"] == "degraded":
+        return jsonify(health), 500
+    else:
+        return jsonify(health), 200
+
 # Create Stripe Checkout Session
 @app.route('/create-checkout-session', methods=['POST'])
+@limiter.limit("10 per minute")
 def create_checkout_session():
     logger.debug("create_checkout_session invoked")
-    data = request.json or {}
+    
+    # Validate request size
+    if request.content_length and request.content_length > app.config['MAX_CONTENT_LENGTH']:
+        logger.warning(f"Request too large: {request.content_length} bytes")
+        return jsonify({'error': 'Request too large'}), 413
+    
+    # Validate request content type
+    if request.content_type != 'application/json':
+        logger.warning(f"Invalid content type: {request.content_type}")
+        return jsonify({'error': 'Content-Type must be application/json'}), 415
+    
+    # Parse and validate request data
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception as e:
+        logger.warning(f"Failed to parse JSON: {e}")
+        return jsonify({'error': 'Invalid JSON'}), 400
+    
     tg_id = data.get('telegram_user_id')
     logger.debug(f"Payload data: {data}")
-    if not tg_id:
-        logger.warning("Missing telegram_user_id in request")
-        return jsonify({'error': 'Missing telegram_user_id'}), 400
+    
+    # Validate telegram_user_id
+    if not validate_telegram_id(tg_id):
+        logger.warning(f"Invalid telegram_user_id: {tg_id}")
+        return jsonify({'error': 'Invalid telegram_user_id'}), 400
 
-    # Create the Stripe Checkout Session
-    session = stripe.checkout.Session.create(
-        payment_method_types=['card'],
-        line_items=[{'price': PRICE_ID, 'quantity': 1}],
-        mode='subscription',
-        success_url='https://survivalsignals.trade/success',
-        cancel_url='https://survivalsignals.trade/cancel',
-        metadata={'telegram_user_id': tg_id},
-        subscription_data={'metadata': {'telegram_user_id': tg_id}}
-    )
-    # Important log: show session ID and associated Telegram ID
-    logger.info(f"Created session {session.id} for TG {tg_id}")
+    try:
+        # Create the Stripe Checkout Session
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{'price': PRICE_ID, 'quantity': 1}],
+            mode='subscription',
+            success_url='https://survivalsignals.trade/success',
+            cancel_url='https://survivalsignals.trade/cancel',
+            metadata={'telegram_user_id': tg_id},
+            subscription_data={'metadata': {'telegram_user_id': tg_id}}
+        )
+        # Important log: show session ID and associated Telegram ID
+        logger.info(f"Created session {session.id} for TG {tg_id}")
 
-    return jsonify({'sessionId': session.id})
+        return jsonify({'sessionId': session.id})
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error: {e}")
+        return jsonify({'error': str(e)}), 500
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return jsonify({'error': 'Server error'}), 500
 
 @app.route('/subscription-details', methods=['POST'])
+@limiter.limit("20 per minute")
 def subscription_details():
-    data = request.json or {}
+    # Validate request size
+    if request.content_length and request.content_length > app.config['MAX_CONTENT_LENGTH']:
+        logger.warning(f"Request too large: {request.content_length} bytes")
+        return jsonify({'error': 'Request too large'}), 413
+    
+    # Validate request content type
+    if request.content_type != 'application/json':
+        logger.warning(f"Invalid content type: {request.content_type}")
+        return jsonify({'error': 'Content-Type must be application/json'}), 415
+    
+    # Parse and validate request data
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception as e:
+        logger.warning(f"Failed to parse JSON: {e}")
+        return jsonify({'error': 'Invalid JSON'}), 400
+    
     tg_id = data.get('telegram_user_id')
     logger.info(f"subscription_details called with telegram_user_id: {tg_id}")
     
-    if not tg_id:
-        logger.warning("Missing telegram_user_id in request")
-        return jsonify({'error': 'Missing telegram_user_id'}), 400
+    # Validate telegram_user_id
+    if not validate_telegram_id(tg_id):
+        logger.warning(f"Invalid telegram_user_id: {tg_id}")
+        return jsonify({'error': 'Invalid telegram_user_id'}), 400
 
     try:
         # Find their subscription via metadata
@@ -300,20 +480,41 @@ def subscription_details():
         logger.info(f"Returning subscription details: {response_data}")
         return jsonify(response_data)
         
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error: {e}")
+        return jsonify({'error': str(e)}), 500
     except Exception as e:
         logger.error(f"Error fetching subscription details: {e}", exc_info=True)
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 # Create Stripe Portal Session
 @app.route('/create-portal-session', methods=['POST'])
+@limiter.limit("10 per minute")
 def create_portal_session():
-    data = request.json or {}
+    # Validate request size
+    if request.content_length and request.content_length > app.config['MAX_CONTENT_LENGTH']:
+        logger.warning(f"Request too large: {request.content_length} bytes")
+        return jsonify({'error': 'Request too large'}), 413
+    
+    # Validate request content type
+    if request.content_type != 'application/json':
+        logger.warning(f"Invalid content type: {request.content_type}")
+        return jsonify({'error': 'Content-Type must be application/json'}), 415
+    
+    # Parse and validate request data
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception as e:
+        logger.warning(f"Failed to parse JSON: {e}")
+        return jsonify({'error': 'Invalid JSON'}), 400
+    
     tg_id = data.get("telegram_user_id")
     logger.info(f"create_portal_session called with telegram_user_id: {tg_id}")
     
-    if not tg_id:
-        logger.warning("Missing telegram_user_id in request")
-        return jsonify({"error": "Missing telegram_user_id"}), 400
+    # Validate telegram_user_id
+    if not validate_telegram_id(tg_id):
+        logger.warning(f"Invalid telegram_user_id: {tg_id}")
+        return jsonify({'error': 'Invalid telegram_user_id'}), 400
 
     try:
         # Search for the subscription whose metadata.telegram_user_id matches
@@ -394,30 +595,42 @@ def create_portal_session():
         }), 500
     except Exception as e:
         logger.error(f"Unexpected error creating portal session: {e}", exc_info=True)
-        return jsonify({
-            "error": "An unexpected error occurred. Please try again later.",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 # Stripe Webhook Endpoint
 @app.route('/webhook/stripe', methods=['GET', 'OPTIONS', 'POST'])
 @app.route('/webhook/stripe/', methods=['GET', 'OPTIONS', 'POST'])
+@limiter.exempt  # Exempt webhooks from rate limiting
 def stripe_webhook():
     logger.debug(f"stripe_webhook invoked, method={request.method}")
     if request.method in ('GET', 'OPTIONS'):
         logger.debug("Health-check or CORS preflight request")
         return jsonify({'status': 'ok'}), 200
 
+    # Validate request size
+    if request.content_length and request.content_length > 1024 * 1024:  # 1MB limit for webhooks
+        logger.warning(f"Webhook payload too large: {request.content_length} bytes")
+        return Response("Payload too large", status=413)
+
     payload = request.get_data(as_text=True)
-    logger.debug(f"Raw payload: {payload}")
+    logger.debug(f"Raw payload: {payload[:1000]}..." if len(payload) > 1000 else payload)
     sig_header = request.headers.get('Stripe-Signature')
+    
+    if not sig_header:
+        logger.error("Missing Stripe-Signature header")
+        return Response("Missing signature", status=400)
+        
     logger.debug(f"Stripe-Signature header: {sig_header}")
+    
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
         logger.info(f"Constructed Stripe event id={event.id} type={event['type']}")
-    except Exception as e:
+    except stripe.error.SignatureVerificationError as e:
         logger.error(f"Webhook signature verification failed: {e}")
-        abort(400)
+        return Response("Invalid signature", status=400)
+    except Exception as e:
+        logger.error(f"Webhook construction failed: {e}")
+        return Response("Invalid payload", status=400)
 
     if already_processed(event.id):
         return '', 200
@@ -433,6 +646,11 @@ def stripe_webhook():
         logger.info(f"checkout.session event, telegram_user_id={tg}")
         if tg:
             try:
+                # Validate telegram_user_id
+                if not validate_telegram_id(tg):
+                    logger.warning(f"Invalid telegram_user_id in webhook: {tg}")
+                    return Response("Invalid telegram_user_id", status=400)
+                    
                 # Send initial invite
                 link = create_one_time_invite()
                 send_dm(tg, f"🎉 Your invite link: {link}")
@@ -465,7 +683,7 @@ def stripe_webhook():
             except Exception as e:
                 logger.error(f"Failed to retrieve Customer: {e}")
         # 3) Fallback: subscription metadata
-        subscription_id = inv.get('parent', {}).get('subscription_details', {}).get('subscription')
+        subscription_id = inv.get('subscription')
         if not tg and subscription_id:
             logger.debug(f"Fetching Subscription metadata for {subscription_id}")
             try:
@@ -477,6 +695,11 @@ def stripe_webhook():
         logger.info(f"Final telegram_user_id determined: {tg}")
         if tg:
             try:
+                # Validate telegram_user_id
+                if not validate_telegram_id(tg):
+                    logger.warning(f"Invalid telegram_user_id in webhook: {tg}")
+                    return Response("Invalid telegram_user_id", status=400)
+                    
                 link = create_one_time_invite()
                 send_dm(tg, f"🔄 Renewal invite link: {link}")
             except Exception as e:
@@ -489,17 +712,25 @@ def stripe_webhook():
         tg = inv.get('metadata', {}).get('telegram_user_id')
         logger.info(f"invoice.payment_failed, telegram_user_id={tg}")
         if tg:
-            send_dm(tg, "❗️ Your payment failed; please update your payment method.")
-            
-            # Remove user from group on payment failure
             try:
-                logger.info(f"Removing user {tg} from Telegram group due to payment failure")
-                if remove_from_telegram_group(tg):
-                    send_dm(tg, "🔒 You've been removed from the group due to payment failure. Please update your payment method to regain access.")
-                    send_signal(f"👋 User {tg} removed from group due to payment failure")
+                # Validate telegram_user_id
+                if not validate_telegram_id(tg):
+                    logger.warning(f"Invalid telegram_user_id in webhook: {tg}")
+                    return Response("Invalid telegram_user_id", status=400)
+                    
+                send_dm(tg, "❗️ Your payment failed; please update your payment method.")
+                
+                # Remove user from group on payment failure
+                try:
+                    logger.info(f"Removing user {tg} from Telegram group due to payment failure")
+                    if remove_from_telegram_group(tg):
+                        send_dm(tg, "🔒 You've been removed from the group due to payment failure. Please update your payment method to regain access.")
+                        send_signal(f"👋 User {tg} removed from group due to payment failure")
+                except Exception as e:
+                    logger.error(f"Error removing user from Telegram group: {e}")
+                    send_signal(f"❌ Error removing user {tg} from group: {e}")
             except Exception as e:
-                logger.error(f"Error removing user from Telegram group: {e}")
-                send_signal(f"❌ Error removing user {tg} from group: {e}")
+                logger.error(f"Error processing payment failure: {e}")
 
     # Handle subscription updates
     elif etype == 'customer.subscription.updated':
@@ -510,18 +741,26 @@ def stripe_webhook():
         
         # Check for cancellation or unpaid status
         if tg and status in ('canceled', 'unpaid'):
-            # Send notification to user
-            send_dm(tg, "🔒 Your subscription has ended; alerts paused.")
-            
-            # Remove user from Telegram group
             try:
-                logger.info(f"Removing user {tg} from Telegram group due to subscription {status}")
-                if remove_from_telegram_group(tg):
-                    send_dm(tg, "👋 You've been removed from the Signals group. Resubscribe anytime to regain access.")
-                    send_signal(f"👋 User {tg} removed from group due to subscription {status}")
+                # Validate telegram_user_id
+                if not validate_telegram_id(tg):
+                    logger.warning(f"Invalid telegram_user_id in webhook: {tg}")
+                    return Response("Invalid telegram_user_id", status=400)
+                    
+                # Send notification to user
+                send_dm(tg, "🔒 Your subscription has ended; alerts paused.")
+                
+                # Remove user from Telegram group
+                try:
+                    logger.info(f"Removing user {tg} from Telegram group due to subscription {status}")
+                    if remove_from_telegram_group(tg):
+                        send_dm(tg, "👋 You've been removed from the Signals group. Resubscribe anytime to regain access.")
+                        send_signal(f"👋 User {tg} removed from group due to subscription {status}")
+                except Exception as e:
+                    logger.error(f"Error removing user from Telegram group: {e}")
+                    send_signal(f"❌ Error removing user {tg} from group: {e}")
             except Exception as e:
-                logger.error(f"Error removing user from Telegram group: {e}")
-                send_signal(f"❌ Error removing user {tg} from group: {e}")
+                logger.error(f"Error processing subscription update: {e}")
     
     # Handle subscription deletion
     elif etype == 'customer.subscription.deleted':
@@ -530,18 +769,26 @@ def stripe_webhook():
         logger.info(f"customer.subscription.deleted, telegram_user_id={tg}")
         
         if tg:
-            # Send notification to user
-            send_dm(tg, "🔒 Your subscription has been deleted; service access revoked.")
-            
-            # Remove user from Telegram group
             try:
-                logger.info(f"Removing user {tg} from Telegram group due to subscription deletion")
-                if remove_from_telegram_group(tg):
-                    send_dm(tg, "👋 You've been removed from the Signals group. Resubscribe anytime to regain access.")
-                    send_signal(f"👋 User {tg} removed from group due to subscription deletion")
+                # Validate telegram_user_id
+                if not validate_telegram_id(tg):
+                    logger.warning(f"Invalid telegram_user_id in webhook: {tg}")
+                    return Response("Invalid telegram_user_id", status=400)
+                    
+                # Send notification to user
+                send_dm(tg, "🔒 Your subscription has been deleted; service access revoked.")
+                
+                # Remove user from Telegram group
+                try:
+                    logger.info(f"Removing user {tg} from Telegram group due to subscription deletion")
+                    if remove_from_telegram_group(tg):
+                        send_dm(tg, "👋 You've been removed from the Signals group. Resubscribe anytime to regain access.")
+                        send_signal(f"👋 User {tg} removed from group due to subscription deletion")
+                except Exception as e:
+                    logger.error(f"Error removing user from Telegram group: {e}")
+                    send_signal(f"❌ Error removing user {tg} from group: {e}")
             except Exception as e:
-                logger.error(f"Error removing user from Telegram group: {e}")
-                send_signal(f"❌ Error removing user {tg} from group: {e}")
+                logger.error(f"Error processing subscription deletion: {e}")
 
     return '', 200
 
