@@ -8,9 +8,6 @@ from flask import Flask, jsonify, request, abort, Response
 from dotenv import load_dotenv
 from notify_signals import send_signal
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Configure detailed logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
@@ -20,23 +17,11 @@ logger = logging.getLogger('app')
 load_dotenv()
 app = Flask(__name__)
 
-# Apply ProxyFix to ensure correct client IP detection behind proxies
-app.wsgi_app = ProxyFix(app, x_for=1, x_proto=1, x_host=1)
-
 # Configure CORS
 CORS(app, origins=[
     "https://survivalsignals.trade",
     "https://www.survivalsignals.trade"
 ], methods=["POST", "GET"], supports_credentials=True)
-
-# Configure rate limiting
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"],
-    storage_uri=os.getenv("REDIS_URL", "memory://"),
-    strategy="fixed-window"
-)
 
 # Set maximum request size (16KB)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024
@@ -310,7 +295,6 @@ def health_check():
 
 # Create Stripe Checkout Session
 @app.route('/create-checkout-session', methods=['POST'])
-@limiter.limit("10 per minute")
 def create_checkout_session():
     logger.debug("create_checkout_session invoked")
     
@@ -362,7 +346,6 @@ def create_checkout_session():
         return jsonify({'error': 'Server error'}), 500
 
 @app.route('/subscription-details', methods=['POST'])
-@limiter.limit("20 per minute")
 def subscription_details():
     # Validate request size
     if request.content_length and request.content_length > app.config['MAX_CONTENT_LENGTH']:
@@ -489,7 +472,6 @@ def subscription_details():
 
 # Create Stripe Portal Session
 @app.route('/create-portal-session', methods=['POST'])
-@limiter.limit("10 per minute")
 def create_portal_session():
     # Validate request size
     if request.content_length and request.content_length > app.config['MAX_CONTENT_LENGTH']:
@@ -600,7 +582,6 @@ def create_portal_session():
 # Stripe Webhook Endpoint
 @app.route('/webhook/stripe', methods=['GET', 'OPTIONS', 'POST'])
 @app.route('/webhook/stripe/', methods=['GET', 'OPTIONS', 'POST'])
-@limiter.exempt  # Exempt webhooks from rate limiting
 def stripe_webhook():
     logger.debug(f"stripe_webhook invoked, method={request.method}")
     if request.method in ('GET', 'OPTIONS'):
